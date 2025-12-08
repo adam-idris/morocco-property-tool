@@ -49,26 +49,26 @@ logging.basicConfig(
 
 #--------------Data Classes--------------#
 @dataclass
-class PropertyListing:
-    title: Optional[str],
-    description: Optional[str],
-    property_type: Optional[str],
-    city: Optional[str],
-    area: Optional[str],
-    size: Optional[int],
-    rooms: Optional[int],
-    bedrooms: Optional[int],
-    bathrooms: Optional[int],
-    price: Optional[int],
-    features: Optional[str],
-    condition: Optional[str],
-    age: Optional[str],
-    orientation: Optional[str],
-    flooring: Optional[str],
-    floor_number: Optional[str],
-    number_of_floors: Optional[int],
-    lat: Optional[float],
-    lon: Optional[float],
+class PropertyDetails:
+    title: Optional[str]
+    description: Optional[str]
+    property_type: Optional[str]
+    city: Optional[str]
+    area: Optional[str]
+    size: Optional[int]
+    rooms: Optional[int]
+    bedrooms: Optional[int]
+    bathrooms: Optional[int]
+    price: Optional[int]
+    features: Optional[str]
+    condition: Optional[str]
+    age: Optional[str]
+    orientation: Optional[str]
+    flooring: Optional[str]
+    floor_number: Optional[int]        # <- changed from Optional[str]
+    number_of_floors: Optional[int]
+    lat: Optional[float]
+    lon: Optional[float]
     url: str
 
 #--------------Helper Functions--------------#
@@ -101,21 +101,73 @@ def save_raw_listing(source: str, link: str, response_text: str) -> None:
     payload = {
         "url": link,
         "html": response_text,
-        "scraped_at_client": datetime.now(timezone.utc).isoformat()
+        "scraped_at_client": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
         supabase.table("raw_listings").upsert(
             {
-                "source": source,
                 "external_id": external_id,
+                "source": source,
                 "payload_json": payload,
             },
-            on_conflict="source,external_id",
+            on_conflict="external_id",   # <- CHANGED
         ).execute()
-
     except Exception as e:
         logging.error(f"Error saving raw listing to Supabase for {link}: {e}")
+        
+def upsert_normalised_listing(
+    details: PropertyDetails,
+    source: str = "mubawab",
+    listing_type: str = "sale",   # for now this script is only for-sale
+) -> None:
+    """
+    Upserts a cleaned property into normalised_listings.
+    """
+    external_id = get_mubawab_external_id(details.url)
+    if not external_id:
+        logging.warning("No external_id for normalized listing: %s", details.url)
+        return
+
+    payload = {
+        "external_id": external_id,
+        "source": source,
+        "listing_type": listing_type,
+
+        "title": details.title,
+        "description": details.description,
+        "property_type": details.property_type,
+        "city": details.city,
+        "area": details.area,
+        "size": details.size,
+        "rooms": details.rooms,
+        "bedrooms": details.bedrooms,
+        "bathrooms": details.bathrooms,
+        "price": details.price,
+        "features": details.features,
+        "condition": details.condition,
+        "age": details.age,
+        "orientation": details.orientation,
+        "flooring": details.flooring,
+        "floor_number": details.floor_number,
+        "number_of_floors": details.number_of_floors,
+        "lat": details.lat,
+        "lon": details.lon,
+        "url": details.url,
+    }
+
+    try:
+        supabase.table("normalised_listings").upsert(
+            payload,
+            on_conflict="external_id",   # PK for this table too
+        ).execute()
+    except Exception as e:
+        logging.error(
+            "Error upserting normalized listing for %s (external_id=%s): %s",
+            details.url,
+            external_id,
+            e,
+        )
         
 #--------------Scraper Functions--------------#
 
@@ -304,7 +356,7 @@ def extract_coordinates(soup: BeautifulSoup) -> Tuple[Optional[float], Optional[
     
 #--------------Main Scraper Logic--------------#
 
-def parse_property_page(link: str, html: str) -> Optional[PropertyListing]:
+def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
     """Parse a single property detail HTML into a PropertyDetails object."""
     soup = BeautifulSoup(html, 'html.parser')
     
@@ -353,8 +405,8 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyListing]:
     age_raw = label_value.get("Age")
     orientation = label_value.get("Orientation")
     flooring = label_value.get("Flooring")
-    floor_number = label_value.get("Floor number")
-    number_of_floors = label_value.get("Number of floors")
+    floor_number = clean_integer(label_value.get("Floor number"))
+    number_of_floors = clean_integer(label_value.get("Number of floors"))
     
     #-- Additional details --#
     size: Optional[int] = None
@@ -389,7 +441,7 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyListing]:
     
     lat, lon = extract_coordinates(soup)
     
-    return PropertyListing(
+    return PropertyDetails(
         title=title,
         description=text_content,
         property_type=prop_type,
@@ -467,59 +519,6 @@ def get_last_external_id(source: str = "mubawab") -> Optional[str]:
         return None
 
     return res.data[0]["external_id"]
-
-def upsert_normalised_listing(details: PropertyListing, source: str = "mubawab") -> None:
-    """
-    Upserts a cleaned property into normalized_listings.
-    """
-    external_id = get_mubawab_external_id(details.url)
-    if not external_id:
-        logging.warning("No external_id for normalized listing: %s", details.url)
-        return
-
-    # Guard against division by zero
-    price_per_m2 = None
-    if details.price and details.size and details.size > 0:
-        price_per_m2 = details.price / details.size
-
-    payload = {
-        "source": source,
-        "external_id": external_id,
-        "title": details.title,
-        "description": details.description,
-        "city": details.city,
-        "area": details.area,
-        "lat": details.lat,
-        "lon": details.lon,
-        "property_type": details.property_type,
-        "rooms": details.rooms,
-        "bedrooms": details.bedrooms,
-        "bathrooms": details.bathrooms,
-        "surface_m2": details.size,
-        "floor": details.floor_number,
-        "number_of_floors": details.number_of_floors,
-        "condition": details.condition,
-        "age_range": details.age,
-        "features": details.features,
-        "price": details.price,
-        "price_per_m2": price_per_m2,
-        "currency": "MAD",
-        "is_rent": True,
-        "listing_url": details.url,
-    }
-
-    try:
-        supabase.table("normalized_listings").upsert(
-            payload,
-            on_conflict="source,external_id",
-        ).execute()
-    except Exception as e:
-        logging.error(
-            "Error upserting normalized listing for %s (external_id=%s): %s",
-            details.url,
-            external_id,
-            e,
-        )
 
 #--------------Main Execution--------------#
 
