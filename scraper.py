@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 import tqdm
+from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -41,6 +42,15 @@ MAX_SLEEP = 3  # seconds
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
+retries = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"],
+)
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +75,7 @@ class PropertyDetails:
     age: Optional[str]
     orientation: Optional[str]
     flooring: Optional[str]
-    floor_number: Optional[int]        # <- changed from Optional[str]
+    floor_number: Optional[int]
     number_of_floors: Optional[int]
     lat: Optional[float]
     lon: Optional[float]
@@ -178,7 +188,7 @@ def fetch(url: str) -> Optional[requests.Response]:
         resp.raise_for_status()
         return resp
     except requests.RequestException as exc:
-        logging.error(f"Request failed for {url}: {e}")
+        logging.error("Request failed for %s: %s", url, exc)
         return None
 
 def get_links(
@@ -327,16 +337,25 @@ def parse_area_and_city(raw_area_text: Optional[str]) -> Tuple[Optional[str], Op
     if match:
         area = match.group(1).strip()
         city = match.group(2).strip()
-        logging.debug(f"Parsed area: '{area}', city: '{city}' from raw_area_text: '{raw_area_text}'")
+        logging.debug(
+            "Parsed area: '%s', city: '%s' from raw_area_text: '%s'",
+            area,
+            city,
+            raw_area_text,
+        )
     else:
         area = None
         city = raw_area_text.strip()
-        logging.debug(f"No 'in' found. Set area to None and city to '{city}' from raw_area_text: '{raw_area_text}'")
+        logging.debug(
+            "No 'in' found. Set area to None and city to '%s' from raw_area_text: '%s'",
+            city,
+            raw_area_text,
+        )
     return area, city
 
 def extract_coordinates(soup: BeautifulSoup) -> Tuple[Optional[float], Optional[float]]:
-    lat = Optional[float] = None
-    lon = Optional[float] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
     
     scripts = soup.find_all("script")
     for s in scripts:
@@ -458,7 +477,7 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
         orientation=orientation,
         flooring=flooring,
         floor_number=floor_number,
-        number_of_floors=clean_integer(number_of_floors),
+        number_of_floors=number_of_floors,
         lat=lat,
         lon=lon,
         url=link
