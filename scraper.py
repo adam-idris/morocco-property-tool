@@ -24,6 +24,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+IMAGE_BUCKET = "property-images"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Supabase URL or Key not found in environment variables.")
@@ -98,19 +99,18 @@ def get_mubawab_external_id(url: str) -> Optional[str]:
     return None
 
 
-def save_raw_listing(source: str, link: str, response_text: str) -> None:
+def save_raw_listing(source: str,
+                     external_id: str,
+                     link: str,
+                     response_text: str,
+                     image_urls: list[str]) -> None:
     """
     Inserts or upserts the raw listing into the raw_listings table.
     """
-    external_id = get_mubawab_external_id(link)
-
-    if external_id is None:
-        logging.warning(f"Could not extract external_id from URL: {link}")
-        return
-
     payload = {
         "url": link,
         "html": response_text,
+        "image_urls": image_urls,
         "scraped_at_client": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -121,29 +121,24 @@ def save_raw_listing(source: str, link: str, response_text: str) -> None:
                 "source": source,
                 "payload_json": payload,
             },
-            on_conflict="external_id",   # <- CHANGED
+            on_conflict="external_id",
         ).execute()
     except Exception as e:
-        logging.error(f"Error saving raw listing to Supabase for {link}: {e}")
+        logging.error(
+            "Error saving raw listing to Supabase for %s: %s", link, e
+        )
         
 def upsert_normalised_listing(
     details: PropertyDetails,
+    external_id: str,
     source: str = "mubawab",
-    listing_type: str = "sale",   # for now this script is only for-sale
+    listing_type: str = "rent",
+    main_image_path: str | None = None,
 ) -> None:
-    """
-    Upserts a cleaned property into normalised_listings.
-    """
-    external_id = get_mubawab_external_id(details.url)
-    if not external_id:
-        logging.warning("No external_id for normalized listing: %s", details.url)
-        return
-
     payload = {
         "external_id": external_id,
         "source": source,
         "listing_type": listing_type,
-
         "title": details.title,
         "description": details.description,
         "property_type": details.property_type,
@@ -164,20 +159,43 @@ def upsert_normalised_listing(
         "lat": details.lat,
         "lon": details.lon,
         "url": details.url,
+        "main_image_path": main_image_path,
     }
 
+    supabase.table("normalized_listings").upsert(
+        payload,
+        on_conflict="external_id",
+    ).execute()
+        
+def upload_avif_to_storage(external_id: str, image_index: int, url: str) -> str | None:
+    """
+    Downloads the AVIF image and uploads it to Supabase Storage.
+    Returns the storage path or None on failure.
+    """
     try:
-        supabase.table("normalised_listings").upsert(
-            payload,
-            on_conflict="external_id",   # PK for this table too
-        ).execute()
-    except Exception as e:
-        logging.error(
-            "Error upserting normalized listing for %s (external_id=%s): %s",
-            details.url,
-            external_id,
-            e,
+        r = session.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        logging.warning("Failed to download image %s: %s", url, exc)
+        return None
+
+    storage_path = f"mubawab/{external_id}/{image_index}.avif"
+
+    try:
+        supabase.storage.from_(IMAGE_BUCKET).upload(
+            path=storage_path,
+            file=r.content,
+            file_options={"content-type": "image/avif", "upsert": True},
         )
+        return storage_path
+    except Exception as exc:
+        logging.error(
+            "Error uploading image for %s[%d] to storage: %s",
+            external_id,
+            image_index,
+            exc,
+        )
+        return None
         
 #--------------Scraper Functions--------------#
 
@@ -251,6 +269,30 @@ def get_links(
         sleep(uniform(MIN_SLEEP, MAX_SLEEP))
 
     return prop_links
+
+def get_image_links(soup: BeautifulSoup) -> list[str]:
+    """
+    Extracts all image URLs from the masonryPhoto container.
+    """
+    urls: list[str] = []
+    container = soup.find("div", id="masonryPhoto")
+    if not container:
+        return urls
+
+    for img in container.find_all("img"):
+        src = img.get("src")
+        if src:
+            urls.append(src)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen:
+            unique_urls.append(u)
+            seen.add(u)
+
+    return unique_urls
 
     
 #--------------Data Cleaning Functions--------------#
@@ -372,6 +414,58 @@ def extract_coordinates(soup: BeautifulSoup) -> Tuple[Optional[float], Optional[
                     logging.error(f"Error parsing lat/long from: {ll}")
     
     return lat, lon
+
+def process_listing_images(external_id: str, image_urls: list[str]) -> str | None:
+    """
+    For a given listing:
+      - uploads each image to Storage
+      - inserts/updates listing_images rows
+    Returns the storage_path of the first image (for main_image_path),
+    or None if no images processed.
+    """
+    main_image_path: str | None = None
+
+    for idx, url in enumerate(image_urls):
+        # Skip if this image_index already exists
+        existing = (
+            supabase.table("listing_images")
+            .select("external_id")
+            .eq("external_id", external_id)
+            .eq("image_index", idx)
+            .execute()
+        )
+        if existing.data:
+            # If we already have a row, use its storage_path for main_image_path if needed
+            if main_image_path is None and idx == 0:
+                main_image_path = (
+                    supabase.table("listing_images")
+                    .select("storage_path")
+                    .eq("external_id", external_id)
+                    .eq("image_index", idx)
+                    .limit(1)
+                    .execute()
+                    .data[0]["storage_path"]
+                )
+            continue
+
+        storage_path = upload_avif_to_storage(external_id, idx, url)
+        if not storage_path:
+            continue
+
+        supabase.table("listing_images").upsert(
+            {
+                "external_id": external_id,
+                "image_index": idx,
+                "original_url": url,
+                "storage_path": storage_path,
+            },
+            on_conflict="external_id,image_index",
+        ).execute()
+
+        if main_image_path is None and idx == 0:
+            main_image_path = storage_path
+
+    return main_image_path
     
 #--------------Main Scraper Logic--------------#
 
@@ -480,64 +574,62 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
         number_of_floors=number_of_floors,
         lat=lat,
         lon=lon,
-        url=link
-        
+        url=link,
+        main_image_path=main_image_path
     )
 
-def get_details(links: List[str]) -> pd.DataFrame:
-    """
-    Scrapes the important features of each property.
+def get_details(links: list[str]) -> pd.DataFrame:
+    properties: list[dict] = []
 
-    Args:
-        links (str): The URLs of each property to be scraped.
-
-    Returns:
-        DataFrame: DataFrame containing property features.
-    """
-    properties: List[dict] = []
-    
     for link in tqdm.tqdm(links, desc="Scraping property details"):
-        
         resp = fetch(link)
         if resp is None:
             continue
-        
-        save_raw_listing(source="mubawab", link=link, response_text=resp.text)
-        
+
+        external_id = get_mubawab_external_id(link)
+        if not external_id:
+            logging.warning("No external_id for %s, skipping.", link)
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 1) Extract image URLs
+        image_urls = get_image_links(soup)
+
+        # 2) Save raw listing (HTML + image URLs)
+        save_raw_listing(
+            source="mubawab",
+            external_id=external_id,
+            link=link,
+            response_text=resp.text,
+            image_urls=image_urls,
+        )
+
         try:
+
             details = parse_property_page(link, resp.text)
             if details is None:
                 continue
             
-            upsert_normalised_listing(details, source="mubawab")
-            
+            main_image_path = process_listing_images(external_id, image_urls)
+
+            upsert_normalised_listing(
+                details,
+                external_id=external_id,
+                source="mubawab",
+                listing_type="rent",
+                main_image_path=main_image_path,
+            )
+
             properties.append(asdict(details))
-        
+
         except Exception as exc:
-            logging.error(f"Error parsing property data from {link}: {exc}")
-            
+            logging.error("Error parsing property %s: %s", link, exc)
+
         sleep(uniform(MIN_SLEEP, MAX_SLEEP))
-            
+
     return pd.DataFrame(properties)
 
-def get_last_external_id(source: str = "mubawab") -> Optional[str]:
-    """
-    Returns the external_id of the most recently scraped listing for a source,
-    or None if table is empty.
-    """
-    res = (
-        supabase.table("raw_listings")
-        .select("external_id, scraped_at")
-        .eq("source", source)
-        .order("scraped_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-
-    if not res.data:
-        return None
-
-    return res.data[0]["external_id"]
 
 #--------------Main Execution--------------#
 
