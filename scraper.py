@@ -11,6 +11,8 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 import tqdm
+import boto3
+from botocore import Config
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -24,12 +26,32 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-IMAGE_BUCKET = "property-images"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Supabase URL or Key not found in environment variables.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+#-----------Cloudflare R2 Setup-----------#
+
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
+CF_ACCESS_KEY_ID = os.getenv("CF_ACCESS_KEY_ID")
+CF_SECRET_ACCESS_KEY = os.getenv("CF_SECRET_KEY")
+CF_BUCKET = os.getenv("CF_BUCKET")
+CF_BASE_URL = os.getenv("CF_ENDPOINT")
+
+if not (CF_ACCOUNT_ID and CF_ACCESS_KEY_ID and CF_SECRET_ACCESS_KEY and CF_BUCKET):
+    raise RuntimeError("Cloudflare R2 credentials or bucket name missing.")
+
+client = boto3.client(
+    "s3",
+    endpoint_url=CF_BASE_URL,
+    aws_access_key_id=CF_ACCESS_KEY_ID,
+    aws_secret_access_key=CF_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+)
+
+#--------------Constants and Session Setup--------------#
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_3_1) "
@@ -197,10 +219,10 @@ def upsert_normalised_listing(
         on_conflict="external_id",
     ).execute()
         
-def upload_avif_to_storage(external_id: str, image_index: int, url: str) -> str | None:
+def upload_avif_to_r2(external_id: str, image_index: int, url: str) -> Optional[str]:
     """
-    Downloads the AVIF image and uploads it to Supabase Storage.
-    Returns the storage path or None on failure.
+    Downloads the AVIF image and uploads it to Cloudflare R2.
+    Returns the public URL (or path) or None on failure.
     """
     try:
         r = session.get(url, timeout=REQUEST_TIMEOUT)
@@ -209,26 +231,30 @@ def upload_avif_to_storage(external_id: str, image_index: int, url: str) -> str 
         logging.warning("Failed to download image %s: %s", url, exc)
         return None
 
-    storage_path = f"mubawab/{external_id}/{image_index}.avif"
+    object_key = f"mubawab/{external_id}/{image_index}.avif"
 
     try:
-        supabase.storage.from_(IMAGE_BUCKET).upload(
-            path=storage_path,
-            file=r.content,
-            file_options={
-                "content-type": "image/avif",
-                "x-upsert": "true",         # 👈 string, not bool
-            },
+        client.put_object(
+            Bucket=CF_BUCKET,
+            Key=object_key,
+            Body=r.content,
+            ContentType="image/avif",
         )
-        return storage_path
     except Exception as exc:
         logging.error(
-            "Error uploading image for %s[%d] to storage: %s",
+            "Error upload   ing image for %s[%d] to R2: %s",
             external_id,
             image_index,
             exc,
         )
         return None
+
+    # If you set CF_PUBLIC_BASE_URL, build a nice URL
+    if CF_BASE_URL:
+        return f"{CF_BASE_URL}/{object_key}"
+
+    # Fallback to direct bucket URL
+    return f"{CF_BASE_URL}/{CF_BUCKET}/{object_key}"
         
 #--------------Scraper Functions--------------#
 
@@ -493,7 +519,7 @@ def process_listing_images(external_id: str, image_urls: list[str]) -> str | Non
                 )
             continue
 
-        storage_path = upload_avif_to_storage(external_id, idx, url)
+        storage_path = upload_avif_to_r2(external_id, idx, url)
         if not storage_path:
             continue
 
