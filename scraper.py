@@ -98,6 +98,36 @@ def get_mubawab_external_id(url: str) -> Optional[str]:
         return f"{prefix}{number}"
     return None
 
+def get_last_external_id(source: str = "mubawab") -> Optional[str]:
+    """
+    Returns the external_id of the most recently scraped listing for a source,
+    or None if the table is empty or the query fails.
+
+    Uses scraped_at for ordering; adjust column name if needed.
+    """
+    try:
+        res = (
+            supabase.table("raw_listings")
+            .select("external_id, scraped_at")  # or scraped_at if you added that
+            .eq("source", source)
+            .order("scraped_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            return None
+
+        return res.data[0]["external_id"]
+
+    except Exception as e:
+        # Log and gracefully fall back to "no last id" so the scraper still runs
+        logging.warning(
+            "Could not fetch last_external_id for %s (treating as first run): %s",
+            source,
+            e,
+        )
+        return None
 
 def save_raw_listing(source: str,
                      external_id: str,
@@ -162,7 +192,7 @@ def upsert_normalised_listing(
         "main_image_path": main_image_path,
     }
 
-    supabase.table("normalized_listings").upsert(
+    supabase.table("normalised_listings").upsert(
         payload,
         on_conflict="external_id",
     ).execute()
@@ -185,7 +215,10 @@ def upload_avif_to_storage(external_id: str, image_index: int, url: str) -> str 
         supabase.storage.from_(IMAGE_BUCKET).upload(
             path=storage_path,
             file=r.content,
-            file_options={"content-type": "image/avif", "upsert": True},
+            file_options={
+                "content-type": "image/avif",
+                "x-upsert": "true",         # 👈 string, not bool
+            },
         )
         return storage_path
     except Exception as exc:
@@ -244,9 +277,16 @@ def get_links(
         logging.info("Processing page %s (%d listings)", page, len(listings))
 
         for listing in listings:
-            link = listing.get("linkref")
+            # Get the linkRef attribute in a case-insensitive way
+            attrs = listing.attrs or {}
+            link = attrs.get("linkRef") or attrs.get("linkref")
             if not link:
-                continue
+                # Fallback: try to find an <a> inside, just in case
+                a_tag = listing.find("a", href=True)
+                if a_tag:
+                    link = a_tag["href"]
+            if not link:
+                continue  # still nothing, skip
 
             external_id = get_mubawab_external_id(link)
             if not external_id:
@@ -264,6 +304,11 @@ def get_links(
                 break
 
             prop_links.append(link)
+
+
+            if not external_id:
+                logging.warning("Could not extract external_id for %s", link)
+                continue
 
         page += 1
         sleep(uniform(MIN_SLEEP, MAX_SLEEP))
@@ -514,7 +559,7 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
             label_value[label] = value
             
     prop_type = label_value.get("Type of property")
-    condition = label_value.get("Condition")
+    condition = clean_condition(label_value.get("Condition"))
     age_raw = label_value.get("Age")
     orientation = label_value.get("Orientation")
     flooring = label_value.get("Flooring")
@@ -574,8 +619,7 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
         number_of_floors=number_of_floors,
         lat=lat,
         lon=lon,
-        url=link,
-        main_image_path=main_image_path
+        url=link
     )
 
 def get_details(links: list[str]) -> pd.DataFrame:
@@ -592,11 +636,9 @@ def get_details(links: list[str]) -> pd.DataFrame:
             continue
 
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 1) Extract image URLs
         image_urls = get_image_links(soup)
 
-        # 2) Save raw listing (HTML + image URLs)
+        # 1) Save raw listing (HTML + image URLs)
         save_raw_listing(
             source="mubawab",
             external_id=external_id,
@@ -606,21 +648,30 @@ def get_details(links: list[str]) -> pd.DataFrame:
         )
 
         try:
-
+            # 2) Parse structured details
             details = parse_property_page(link, resp.text)
             if details is None:
                 continue
-            
-            main_image_path = process_listing_images(external_id, image_urls)
 
+            # 3) Upsert normalised listing *without* main_image_path yet
             upsert_normalised_listing(
                 details,
                 external_id=external_id,
                 source="mubawab",
                 listing_type="rent",
-                main_image_path=main_image_path,
+                main_image_path=None,
             )
 
+            # 4) Now process images – FK will be satisfied
+            main_image_path = process_listing_images(external_id, image_urls)
+
+            # 5) If we have a main image, update the listing row
+            if main_image_path:
+                supabase.table("normalised_listings").update(
+                    {"main_image_path": main_image_path}
+                ).eq("external_id", external_id).execute()
+
+            # 6) Keep for DataFrame output
             properties.append(asdict(details))
 
         except Exception as exc:
@@ -635,7 +686,7 @@ def get_details(links: list[str]) -> pd.DataFrame:
 
 def main() -> None:
     base_url = "https://www.mubawab.ma/en/cc/real-estate-for-rent"
-    max_pages = 50
+    max_pages = 1
 
     logging.info("Starting incremental link scraping...")
     links = get_links(base_url, max_pages=max_pages, source="mubawab")
