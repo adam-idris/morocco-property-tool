@@ -12,8 +12,9 @@ import pandas as pd
 import requests
 import tqdm
 import boto3
-from botocore import Config
+from botocore.client import Config
 from requests.adapters import HTTPAdapter, Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -35,7 +36,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 #-----------Cloudflare R2 Setup-----------#
 
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
-CF_ACCESS_KEY_ID = os.getenv("CF_ACCESS_KEY_ID")
+CF_ACCESS_KEY_ID = os.getenv("CF_ACCESS_KEY")
 CF_SECRET_ACCESS_KEY = os.getenv("CF_SECRET_KEY")
 CF_BUCKET = os.getenv("CF_BUCKET")
 CF_BASE_URL = os.getenv("CF_ENDPOINT")
@@ -43,7 +44,8 @@ CF_BASE_URL = os.getenv("CF_ENDPOINT")
 if not (CF_ACCOUNT_ID and CF_ACCESS_KEY_ID and CF_SECRET_ACCESS_KEY and CF_BUCKET):
     raise RuntimeError("Cloudflare R2 credentials or bucket name missing.")
 
-client = boto3.client(
+
+r2_client = boto3.client(
     "s3",
     endpoint_url=CF_BASE_URL,
     aws_access_key_id=CF_ACCESS_KEY_ID,
@@ -106,6 +108,101 @@ class PropertyDetails:
 
 #--------------Helper Functions--------------#
 
+def load_existing_external_ids(
+    source: str = "mubawab",
+    listing_type: str | None = None,
+) -> set[str]:
+    """
+    Load already-scraped external_ids from normalised_listings
+    into a Python set for fast membership checks.
+
+    This is our 'cache' so we don't keep hitting Supabase for each ID.
+    """
+    ids: set[str] = set()
+    try:
+        query = supabase.table("normalised_listings").select("external_id").eq("source", source)
+
+        if listing_type is not None:
+            query = query.eq("listing_type", listing_type)
+
+        res = query.execute()
+
+        for row in res.data:
+            ext_id = row.get("external_id")
+            if ext_id:
+                ids.add(ext_id)
+
+        logging.info("Loaded %d existing external_ids into cache.", len(ids))
+    except Exception as e:
+        logging.error("Failed to load existing external_ids: %s", e)
+
+    return ids
+
+def is_already_scraped(external_id: str, existing_ids: set[str]) -> bool:
+    """
+    Check in-memory cache first (O(1)). If absent, treat as new.
+    We rely on upsert in Supabase to make reruns idempotent anyway.
+    """
+    return external_id in existing_ids
+
+def process_single_listing(
+    link: str,
+    existing_ids: set[str],
+    source: str = "mubawab",
+    listing_type: str = "rent",
+) -> dict | None:
+    """
+    Fetch, parse, upload images, and upsert a single listing.
+    Returns a dict for the DataFrame, or None on failure.
+    """
+    external_id = get_mubawab_external_id(link)
+    if not external_id:
+        logging.warning("No external_id for %s, skipping.", link)
+        return None
+
+    # Double-check against cache at the start of the worker
+    if is_already_scraped(external_id, existing_ids):
+        return None
+
+    resp = fetch(link)
+    if resp is None:
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    image_urls = get_image_links(soup)
+
+    # 1) Save raw listing
+    save_raw_listing(
+        source=source,
+        external_id=external_id,
+        link=link,
+        response_text=resp.text,
+        image_urls=image_urls,
+    )
+
+    # 2) Parse details
+    details = parse_property_page(link, resp.text)
+    if details is None:
+        return None
+
+    # 3) Upload images → R2 + listing_images table
+    main_image_path = process_listing_images(external_id, image_urls)
+
+    # 4) Upsert into normalised_listings
+    upsert_normalised_listing(
+        details=details,
+        external_id=external_id,
+        source=source,
+        listing_type=listing_type,
+        main_image_path=main_image_path,
+    )
+
+    # Optionally update cache so subsequent workers in this run see it:
+    existing_ids.add(external_id)
+
+    return asdict(details)
+
+
 def get_mubawab_external_id(url: str) -> Optional[str]:
     """
     Extracts a combined ID such as:
@@ -119,37 +216,6 @@ def get_mubawab_external_id(url: str) -> Optional[str]:
         number = match.group(2)
         return f"{prefix}{number}"
     return None
-
-def get_last_external_id(source: str = "mubawab") -> Optional[str]:
-    """
-    Returns the external_id of the most recently scraped listing for a source,
-    or None if the table is empty or the query fails.
-
-    Uses scraped_at for ordering; adjust column name if needed.
-    """
-    try:
-        res = (
-            supabase.table("raw_listings")
-            .select("external_id, scraped_at")  # or scraped_at if you added that
-            .eq("source", source)
-            .order("scraped_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if not res.data:
-            return None
-
-        return res.data[0]["external_id"]
-
-    except Exception as e:
-        # Log and gracefully fall back to "no last id" so the scraper still runs
-        logging.warning(
-            "Could not fetch last_external_id for %s (treating as first run): %s",
-            source,
-            e,
-        )
-        return None
 
 def save_raw_listing(source: str,
                      external_id: str,
@@ -225,36 +291,26 @@ def upload_avif_to_r2(external_id: str, image_index: int, url: str) -> Optional[
     Returns the public URL (or path) or None on failure.
     """
     try:
+        
         r = session.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
     except requests.RequestException as exc:
         logging.warning("Failed to download image %s: %s", url, exc)
         return None
 
-    object_key = f"mubawab/{external_id}/{image_index}.avif"
+    storage_path = f"mubawab/{external_id}/{image_index}.avif"
 
     try:
-        client.put_object(
+        r2_client.put_object(
             Bucket=CF_BUCKET,
-            Key=object_key,
+            Key=storage_path,
             Body=r.content,
             ContentType="image/avif",
         )
-    except Exception as exc:
-        logging.error(
-            "Error upload   ing image for %s[%d] to R2: %s",
-            external_id,
-            image_index,
-            exc,
-        )
+        return storage_path
+    except Exception as e:
+        logging.error("R2 upload failed for %s[%d]: %s", external_id, image_index, e)
         return None
-
-    # If you set CF_PUBLIC_BASE_URL, build a nice URL
-    if CF_BASE_URL:
-        return f"{CF_BASE_URL}/{object_key}"
-
-    # Fallback to direct bucket URL
-    return f"{CF_BASE_URL}/{CF_BUCKET}/{object_key}"
         
 #--------------Scraper Functions--------------#
 
@@ -270,76 +326,57 @@ def fetch(url: str) -> Optional[requests.Response]:
 
 def get_links(
     base_url: str,
-    max_pages: int = 50,
-    source: str = "mubawab",
+    max_pages: int,
+    existing_ids: set[str],
 ) -> list[str]:
     """
-    Scrape links newest to oldest until we hit the last external_id
-    we saw on a previous run.
+    Scrape ALL listing links from Mubawab (up to max_pages),
+    and return only links whose external_id is NOT in existing_ids.
     """
-    last_external_id = get_last_external_id(source=source)
-    if last_external_id:
-        logging.info("Last seen external_id for %s: %s", source, last_external_id)
-    else:
-        logging.info("No previous external_id found for %s (first run).", source)
+    new_links: list[str] = []
 
-    prop_links: list[str] = []
-    page = 1
-    stop_pagination = False
-
-    while page <= max_pages and not stop_pagination:
+    for page in range(1, max_pages + 1):
         page_url = f"{base_url}:p:{page}"
+        logging.info("Processing page %s", page_url)
+
         resp = fetch(page_url)
         if resp is None:
+            logging.warning("Failed to fetch page %s, stopping pagination.", page_url)
             break
 
-        soup = BeautifulSoup(resp.content, "html.parser")
-        listings = soup.find_all("div", class_="listingBox sPremium")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        if not listings:
-            logging.info("No listings found on page %s. Stopping.", page)
+        # ✅ correct structure: li.listing-box
+        listing_elements = soup.select("li.listing-box")
+        if not listing_elements:
+            logging.info("No listings found on page %s, stopping.", page)
             break
 
-        logging.info("Processing page %s (%d listings)", page, len(listings))
+        logging.info("Found %d listing elements on page %d", len(listing_elements), page)
 
-        for listing in listings:
-            # Get the linkRef attribute in a case-insensitive way
-            attrs = listing.attrs or {}
-            link = attrs.get("linkRef") or attrs.get("linkref")
-            if not link:
-                # Fallback: try to find an <a> inside, just in case
-                a_tag = listing.find("a", href=True)
-                if a_tag:
-                    link = a_tag["href"]
-            if not link:
-                continue  # still nothing, skip
-
-            external_id = get_mubawab_external_id(link)
-            if not external_id:
-                logging.warning("Could not extract external_id for %s", link)
-                prop_links.append(link)
+        for box in listing_elements:
+            a = box.find("a", href=True)
+            if not a:
                 continue
 
-            if last_external_id and external_id == last_external_id:
-                logging.info(
-                    "Hit last seen listing %s (external_id=%s). Stopping pagination.",
-                    link,
-                    external_id,
-                )
-                stop_pagination = True
-                break
+            url = a["href"]
+            if url.startswith("/"):
+                url = "https://www.mubawab.ma" + url
 
-            prop_links.append(link)
-
-
+            external_id = get_mubawab_external_id(url)
             if not external_id:
-                logging.warning("Could not extract external_id for %s", link)
                 continue
 
-        page += 1
+            if is_already_scraped(external_id, existing_ids):
+                # Already in normalised_listings → skip.
+                continue
+
+            new_links.append(url)
+
         sleep(uniform(MIN_SLEEP, MAX_SLEEP))
 
-    return prop_links
+    logging.info("Total NEW links collected this run: %d", len(new_links))
+    return new_links
 
 def get_image_links(soup: BeautifulSoup) -> list[str]:
     """
@@ -648,80 +685,62 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
         url=link
     )
 
-def get_details(links: list[str]) -> pd.DataFrame:
+def get_details(
+    links: list[str],
+    existing_ids: set[str],
+    source: str = "mubawab",
+    listing_type: str = "rent",
+    max_workers: int = 5,
+) -> pd.DataFrame:
+    """
+    Process listing details concurrently using a ThreadPoolExecutor.
+    Each listing is fully independent and safe to run in parallel.
+    """
     properties: list[dict] = []
 
-    for link in tqdm.tqdm(links, desc="Scraping property details"):
-        resp = fetch(link)
-        if resp is None:
-            continue
+    if not links:
+        return pd.DataFrame()
 
-        external_id = get_mubawab_external_id(link)
-        if not external_id:
-            logging.warning("No external_id for %s, skipping.", link)
-            continue
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_link = {
+            executor.submit(
+                process_single_listing,
+                link,
+                existing_ids,
+                source,
+                listing_type,
+            ): link
+            for link in links
+        }
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        image_urls = get_image_links(soup)
-
-        # 1) Save raw listing (HTML + image URLs)
-        save_raw_listing(
-            source="mubawab",
-            external_id=external_id,
-            link=link,
-            response_text=resp.text,
-            image_urls=image_urls,
-        )
-
-        try:
-            # 2) Parse structured details
-            details = parse_property_page(link, resp.text)
-            if details is None:
-                continue
-
-            # 3) Upsert normalised listing *without* main_image_path yet
-            upsert_normalised_listing(
-                details,
-                external_id=external_id,
-                source="mubawab",
-                listing_type="rent",
-                main_image_path=None,
-            )
-
-            # 4) Now process images – FK will be satisfied
-            main_image_path = process_listing_images(external_id, image_urls)
-
-            # 5) If we have a main image, update the listing row
-            if main_image_path:
-                supabase.table("normalised_listings").update(
-                    {"main_image_path": main_image_path}
-                ).eq("external_id", external_id).execute()
-
-            # 6) Keep for DataFrame output
-            properties.append(asdict(details))
-
-        except Exception as exc:
-            logging.error("Error parsing property %s: %s", link, exc)
-
-        sleep(uniform(MIN_SLEEP, MAX_SLEEP))
+        for future in tqdm.tqdm(as_completed(future_to_link), total=len(future_to_link), desc="Scraping property details"):
+            link = future_to_link[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    properties.append(result)
+            except Exception as exc:
+                logging.error("Unhandled exception processing %s: %s", link, exc)
 
     return pd.DataFrame(properties)
-
 
 #--------------Main Execution--------------#
 
 def main() -> None:
     base_url = "https://www.mubawab.ma/en/cc/real-estate-for-rent"
-    max_pages = 1
+    max_pages = 83
 
-    logging.info("Starting incremental link scraping...")
-    links = get_links(base_url, max_pages=max_pages, source="mubawab")
+    existing_ids = load_existing_external_ids(source="mubawab", listing_type="rent")
+
+    logging.info("Starting full scan link scraping (skipping already-scraped IDs)...")
+    links = get_links(base_url, max_pages=max_pages, existing_ids=existing_ids)
     logging.info("Found %d NEW property links.", len(links))
 
-    logging.info("Scraping property details and writing to Supabase...")
-    df = get_details(links)
-    logging.info("Scraped %d properties.", len(df))
+    logging.info("Scraping property details concurrently and writing to Supabase + R2...")
+    df = get_details(links, existing_ids=existing_ids, source="mubawab", listing_type="rent")
+    logging.info("Scraped %d NEW properties this run.", len(df))
     logging.info("Done.")
     
+
 if __name__ == "__main__":
     main()
