@@ -340,13 +340,24 @@ def get_links(
     base_url: str,
     max_pages: int,
     existing_ids: set[str],
-) -> list[str]:
+) -> list[dict]:
     """
-    Scrape ALL listing links from Mubawab (up to max_pages),
-    and return only links whose external_id is NOT in existing_ids.
-    Uses the div.listingBox[linkref] structure confirmed from the HTML.
+    Scrape ALL listing cards from Mubawab (up to max_pages) and return
+    a list of dicts with metadata:
+
+      {
+        "url":          full_listing_url,
+        "external_id":  "a1234567",
+        "listing_tier": "premium",
+        "is_adboost":   False,
+      }
+
+    We skip:
+      - already-scraped external_ids,
+      - adBoostBox cards (sale ads in rent pages).
     """
-    new_links: list[str] = []
+    from bs4 import BeautifulSoup
+    new_listings: list[dict] = []
 
     for page in range(1, max_pages + 1):
         page_url = f"{base_url}:p:{page}"
@@ -359,31 +370,49 @@ def get_links(
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        listing_elements = soup.select("div.listingBox[linkref]")
-        if not listing_elements:
-            logging.info("No listings found on page %d, stopping.", page)
+        # div.listingBox[linkref] was your working selector
+        boxes = soup.select("div.listingBox[linkref]")
+        if not boxes:
+            logging.info("No listings found on page %s, stopping.", page)
             break
 
-        logging.info("Found %d listing elements on page %d", len(listing_elements), page)
+        logging.info("Found %d listing elements on page %d", len(boxes), page)
 
-        for box in listing_elements:
+        for box in boxes:
             url = box.get("linkref")
             if not url:
                 continue
+
+            if url.startswith("/"):
+                url = "https://www.mubawab.ma" + url
 
             external_id = get_mubawab_external_id(url)
             if not external_id:
                 continue
 
+            # skip if already normalised
             if external_id in existing_ids:
                 continue
 
-            new_links.append(url)
+            listing_tier, is_adboost = classify_listing_box(box)
+
+            # drop adBoostBox from the rental dataset
+            if is_adboost:
+                continue
+
+            new_listings.append(
+                {
+                    "url": url,
+                    "external_id": external_id,
+                    "listing_tier": listing_tier,
+                    "is_adboost": is_adboost,
+                }
+            )
 
         sleep(uniform(MIN_SLEEP, MAX_SLEEP))
 
-    logging.info("Total NEW links collected this run: %d", len(new_links))
-    return new_links
+    logging.info("Total NEW links collected this run: %d", len(new_listings))
+    return new_listings
 
 def get_image_links(soup: BeautifulSoup) -> list[str]:
     """
@@ -757,30 +786,40 @@ def extract_agent_info(soup: BeautifulSoup) -> tuple[Optional[str], Optional[str
 #--------------Main Execution--------------#
 
 def main() -> None:
+    # Base rent URL – adjust if you add other listing types later
     base_url = "https://www.mubawab.ma/en/cc/real-estate-for-rent"
-    max_pages = 535  # or whatever upper bound you want
 
-    # existing_ids = set of normalised external_ids
+    # Full catalog: you said ~535 pages for rent
+    max_pages = 536
+
+    logging.info("Loading existing external_ids cache from normalised_listings...")
     existing_ids = load_existing_external_ids(source="mubawab", listing_type="rent")
+    logging.info("Loaded %d existing external_ids into cache.", len(existing_ids))
 
     logging.info("Starting full scan link scraping (skipping already-scraped IDs)...")
-    listings = get_links(base_url, max_pages=max_pages, existing_ids=existing_ids)
+    listings = get_links(
+        base_url=base_url,
+        max_pages=max_pages,
+        existing_ids=existing_ids,
+    )
+    logging.info("Collected %d NEW listings to scrape.", len(listings))
 
-    logging.info("Detected %d NEW links.", len(listings))
     if not listings:
-        logging.info("Nothing new to scrape. Exiting.")
+        logging.info("No new listings found. Exiting.")
         return
 
-    # Simple manual confirmation
-    answer = input(f"{len(listings)} new links found. Proceed with scraping? [Y/n] ").strip().lower()
-    if answer not in ("y", "yes", ""):
-        logging.info("User aborted scraping.")
-        return
-
-    logging.info("Scraping property details and writing to Supabase + R2...")
-    df = get_details(listings, source="mubawab", listing_type="rent")
+    logging.info(
+        "Scraping property details and writing to Supabase + R2 for %d listings...",
+        len(listings),
+    )
+    df = get_details(
+        listings,
+        source="mubawab",
+        listing_type="rent",
+    )
     logging.info("Scraped %d NEW properties this run.", len(df))
     logging.info("Done.")
+
 
 if __name__ == "__main__":
     main()
