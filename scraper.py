@@ -105,37 +105,33 @@ class PropertyDetails:
     lat: Optional[float]
     lon: Optional[float]
     url: str
+    agent_type: Optional[str] = None      # 'agency' / 'particular'
+    agent_name: Optional[str] = None
+    agent_url: Optional[str] = None
 
 #--------------Helper Functions--------------#
 
 def load_existing_external_ids(
     source: str = "mubawab",
-    listing_type: str | None = None,
+    listing_type: Optional[str] = "rent",
 ) -> set[str]:
-    """
-    Load already-scraped external_ids from normalised_listings
-    into a Python set for fast membership checks.
-
-    This is our 'cache' so we don't keep hitting Supabase for each ID.
-    """
     ids: set[str] = set()
     try:
-        query = supabase.table("normalised_listings").select("external_id").eq("source", source)
-
+        query = (
+            supabase.table("normalised_listings")
+            .select("external_id")
+            .eq("source", source)
+        )
         if listing_type is not None:
             query = query.eq("listing_type", listing_type)
-
         res = query.execute()
-
         for row in res.data:
-            ext_id = row.get("external_id")
-            if ext_id:
-                ids.add(ext_id)
-
+            eid = row.get("external_id")
+            if eid:
+                ids.add(eid)
         logging.info("Loaded %d existing external_ids into cache.", len(ids))
     except Exception as e:
-        logging.error("Failed to load existing external_ids: %s", e)
-
+        logging.error("Failed to load existing ids: %s", e)
     return ids
 
 def is_already_scraped(external_id: str, existing_ids: set[str]) -> bool:
@@ -146,62 +142,80 @@ def is_already_scraped(external_id: str, existing_ids: set[str]) -> bool:
     return external_id in existing_ids
 
 def process_single_listing(
-    link: str,
-    existing_ids: set[str],
+    listing_meta: dict,
     source: str = "mubawab",
     listing_type: str = "rent",
-) -> dict | None:
-    """
-    Fetch, parse, upload images, and upsert a single listing.
-    Returns a dict for the DataFrame, or None on failure.
-    """
-    external_id = get_mubawab_external_id(link)
-    if not external_id:
-        logging.warning("No external_id for %s, skipping.", link)
-        return None
+) -> Optional[dict]:
+    url = listing_meta["url"]
+    external_id = listing_meta["external_id"]
+    listing_tier = listing_meta["listing_tier"]
 
-    # Double-check against cache at the start of the worker
-    if is_already_scraped(external_id, existing_ids):
-        return None
-
-    resp = fetch(link)
+    resp = fetch(url)
     if resp is None:
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
     image_urls = get_image_links(soup)
 
-    # 1) Save raw listing
-    save_raw_listing(
-        source=source,
-        external_id=external_id,
-        link=link,
-        response_text=resp.text,
-        image_urls=image_urls,
-    )
+    agent_type, agent_name, agent_url = extract_agency_info(soup)
 
-    # 2) Parse details
-    details = parse_property_page(link, resp.text)
+    # Parse property details
+    details = parse_property_page(url, resp.text)
     if details is None:
         return None
 
-    # 3) Upload images → R2 + listing_images table
+    # Attach agency info to details dataclass
+    details.agent_type = agent_type
+    details.agent_name = agent_name
+    details.agent_url = agent_url
+
+    # 1) Save raw listing (including agency + tier)
+    save_raw_listing(
+        source=source,
+        listing_type=listing_type,
+        external_id=external_id,
+        link=url,
+        response_text=resp.text,
+        image_urls=image_urls,
+        listing_tier=listing_tier,
+        agent_type=agent_type,
+        agent_name=agent_name,
+        agent_url=agent_url,
+    )
+
+    # 2) Upload images to R2 and create listing_images rows
     main_image_path = process_listing_images(external_id, image_urls)
 
-    # 4) Upsert into normalised_listings
+    # 3) Upsert into normalised_listings
     upsert_normalised_listing(
         details=details,
         external_id=external_id,
         source=source,
         listing_type=listing_type,
         main_image_path=main_image_path,
+        listing_tier=listing_tier,
     )
-
-    # Optionally update cache so subsequent workers in this run see it:
-    existing_ids.add(external_id)
 
     return asdict(details)
 
+def classify_listing_box(box: BeautifulSoup) -> tuple[str, bool]:
+    """
+    Based on the class list of a listingBox, return (tier, is_adboost).
+    tier: 'super_premium', 'premium', 'standard'
+    """
+    classes = box.get("class", [])
+    classes_set = {c.lower() for c in classes}
+
+    is_adboost = "adboostbox" in classes_set
+
+    if "spremium" in classes_set:
+        tier = "super_premium"
+    elif "premium" in classes_set:
+        tier = "premium"
+    else:
+        tier = "standard"
+
+    return tier, is_adboost
 
 def get_mubawab_external_id(url: str) -> Optional[str]:
     """
@@ -217,19 +231,32 @@ def get_mubawab_external_id(url: str) -> Optional[str]:
         return f"{prefix}{number}"
     return None
 
-def save_raw_listing(source: str,
-                     external_id: str,
-                     link: str,
-                     response_text: str,
-                     image_urls: list[str]) -> None:
+def save_raw_listing(
+    source: str,
+    external_id: str,
+    link: str,
+    response_text: str,
+    image_urls: list[str],
+    *,
+    listing_tier: str,
+    is_adboost: bool,
+    details: PropertyDetails,
+) -> None:
     """
     Inserts or upserts the raw listing into the raw_listings table.
+
+    IMPORTANT: agent_url lives here (in payload_json), not in normalised_listings.
     """
     payload = {
         "url": link,
         "html": response_text,
         "image_urls": image_urls,
         "scraped_at_client": datetime.now(timezone.utc).isoformat(),
+        "listing_tier": listing_tier,
+        "is_adboost": is_adboost,
+        "agent_type": details.agent_type,
+        "agent_name": details.agent_name,
+        "agent_url": details.agent_url,
     }
 
     try:
@@ -242,17 +269,24 @@ def save_raw_listing(source: str,
             on_conflict="external_id",
         ).execute()
     except Exception as e:
-        logging.error(
-            "Error saving raw listing to Supabase for %s: %s", link, e
-        )
-        
+        logging.error("Error saving raw listing to Supabase for %s: %s", link, e)
+
+
 def upsert_normalised_listing(
     details: PropertyDetails,
     external_id: str,
+    *,
     source: str = "mubawab",
     listing_type: str = "rent",
+    listing_tier: str,
+    is_adboost: bool,
     main_image_path: str | None = None,
 ) -> None:
+    """
+    Write a clean, ML-ready row to normalised_listings.
+
+    NOTE: agent_url is NOT stored here.
+    """
     payload = {
         "external_id": external_id,
         "source": source,
@@ -278,39 +312,17 @@ def upsert_normalised_listing(
         "lon": details.lon,
         "url": details.url,
         "main_image_path": main_image_path,
+        
+        "agent_type": details.agent_type,
+        "agent_name": details.agent_name,
+        "listing_tier": listing_tier,
+        "is_adboost": is_adboost,
     }
 
     supabase.table("normalised_listings").upsert(
         payload,
         on_conflict="external_id",
     ).execute()
-        
-def upload_avif_to_r2(external_id: str, image_index: int, url: str) -> Optional[str]:
-    """
-    Downloads the AVIF image and uploads it to Cloudflare R2.
-    Returns the public URL (or path) or None on failure.
-    """
-    try:
-        
-        r = session.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except requests.RequestException as exc:
-        logging.warning("Failed to download image %s: %s", url, exc)
-        return None
-
-    storage_path = f"mubawab/{external_id}/{image_index}.avif"
-
-    try:
-        r2_client.put_object(
-            Bucket=CF_BUCKET,
-            Key=storage_path,
-            Body=r.content,
-            ContentType="image/avif",
-        )
-        return storage_path
-    except Exception as e:
-        logging.error("R2 upload failed for %s[%d]: %s", external_id, image_index, e)
-        return None
         
 #--------------Scraper Functions--------------#
 
@@ -332,6 +344,7 @@ def get_links(
     """
     Scrape ALL listing links from Mubawab (up to max_pages),
     and return only links whose external_id is NOT in existing_ids.
+    Uses the div.listingBox[linkref] structure confirmed from the HTML.
     """
     new_links: list[str] = []
 
@@ -346,29 +359,23 @@ def get_links(
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # ✅ correct structure: li.listing-box
-        listing_elements = soup.select("li.listing-box")
+        listing_elements = soup.select("div.listingBox[linkref]")
         if not listing_elements:
-            logging.info("No listings found on page %s, stopping.", page)
+            logging.info("No listings found on page %d, stopping.", page)
             break
 
         logging.info("Found %d listing elements on page %d", len(listing_elements), page)
 
         for box in listing_elements:
-            a = box.find("a", href=True)
-            if not a:
+            url = box.get("linkref")
+            if not url:
                 continue
-
-            url = a["href"]
-            if url.startswith("/"):
-                url = "https://www.mubawab.ma" + url
 
             external_id = get_mubawab_external_id(url)
             if not external_id:
                 continue
 
-            if is_already_scraped(external_id, existing_ids):
-                # Already in normalised_listings → skip.
+            if external_id in existing_ids:
                 continue
 
             new_links.append(url)
@@ -401,7 +408,6 @@ def get_image_links(soup: BeautifulSoup) -> list[str]:
             seen.add(u)
 
     return unique_urls
-
     
 #--------------Data Cleaning Functions--------------#
 
@@ -635,8 +641,8 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
     bedrooms: Optional[int] = None
     bathrooms: Optional[int] = None
     
-    details = soup.find_all('div', class_='adDetailFeature')
-    for detail in details:
+    details_block = soup.find_all('div', class_='adDetailFeature')
+    for detail in details_block:
         text = detail.get_text(strip=True)
         span = detail.find('span')
         if not span:
@@ -661,6 +667,9 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
     feature_str = ', '.join(filter(None, features_list)) if features_list else None
     
     lat, lon = extract_coordinates(soup)
+
+    # 👇 NEW: agent metadata
+    agent_type, agent_name, agent_url = extract_agent_info(soup)
     
     return PropertyDetails(
         title=title,
@@ -682,65 +691,96 @@ def parse_property_page(link: str, html: str) -> Optional[PropertyDetails]:
         number_of_floors=number_of_floors,
         lat=lat,
         lon=lon,
-        url=link
+        url=link,
+        agent_type=agent_type,
+        agent_name=agent_name,
+        agent_url=agent_url,
     )
 
 def get_details(
-    links: list[str],
-    existing_ids: set[str],
+    listings_meta: list[dict],
     source: str = "mubawab",
     listing_type: str = "rent",
-    max_workers: int = 5,
 ) -> pd.DataFrame:
+    rows: list[dict] = []
+    for listing_meta in tqdm.tqdm(listings_meta, desc="Scraping property details"):
+        try:
+            result = process_single_listing(listing_meta, source, listing_type)
+            if result is not None:
+                rows.append(result)
+        except Exception as e:
+            logging.error("Unhandled exception processing %s: %s", listing_meta["url"], e)
+    return pd.DataFrame(rows)
+
+def extract_agent_info(soup: BeautifulSoup) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Process listing details concurrently using a ThreadPoolExecutor.
-    Each listing is fully independent and safe to run in parallel.
+    Extract agent_type, agent_name, agent_url from the property page.
+
+    Returns:
+        (agent_type, agent_name, agent_url)
+
+        agent_type ∈ {"agency", "individual", None}
     """
-    properties: list[dict] = []
+    agent_type = None
+    agent_name = None
+    agent_url = None
 
-    if not links:
-        return pd.DataFrame()
+    info = soup.find("div", class_="businessInfo")
+    if not info:
+        return agent_type, agent_name, agent_url
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_link = {
-            executor.submit(
-                process_single_listing,
-                link,
-                existing_ids,
-                source,
-                listing_type,
-            ): link
-            for link in links
-        }
+    # The agency / individual name is in span.link.businessName
+    span = info.select_one("span.link.businessName")
+    if not span:
+        return agent_type, agent_name, agent_url
 
-        for future in tqdm.tqdm(as_completed(future_to_link), total=len(future_to_link), desc="Scraping property details"):
-            link = future_to_link[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    properties.append(result)
-            except Exception as exc:
-                logging.error("Unhandled exception processing %s: %s", link, exc)
+    # If there's an <a>, it's an agency with its own page
+    a_tag = span.find("a", href=True)
+    if a_tag:
+        agent_name = a_tag.get_text(strip=True)
+        agent_url = a_tag["href"]
+        # look for "Agency" / "Particular" text nearby
+        type_text = span.get_text(" ", strip=True).lower()
+        if "agency" in type_text:
+            agent_type = "agency"
+        elif "particular" in type_text:
+            agent_type = "individual"
+        else:
+            agent_type = "agency"  # sensible default
+    else:
+        # No link → usually a private individual
+        agent_name = span.get_text(strip=True)
+        agent_type = "individual"
 
-    return pd.DataFrame(properties)
+    return agent_type, agent_name, agent_url
 
 #--------------Main Execution--------------#
 
 def main() -> None:
     base_url = "https://www.mubawab.ma/en/cc/real-estate-for-rent"
-    max_pages = 83
+    max_pages = 535  # or whatever upper bound you want
 
+    # existing_ids = set of normalised external_ids
     existing_ids = load_existing_external_ids(source="mubawab", listing_type="rent")
 
     logging.info("Starting full scan link scraping (skipping already-scraped IDs)...")
-    links = get_links(base_url, max_pages=max_pages, existing_ids=existing_ids)
-    logging.info("Found %d NEW property links.", len(links))
+    listings = get_links(base_url, max_pages=max_pages, existing_ids=existing_ids)
 
-    logging.info("Scraping property details concurrently and writing to Supabase + R2...")
-    df = get_details(links, existing_ids=existing_ids, source="mubawab", listing_type="rent")
+    logging.info("Detected %d NEW links.", len(listings))
+    if not listings:
+        logging.info("Nothing new to scrape. Exiting.")
+        return
+
+    # Simple manual confirmation
+    answer = input(f"{len(listings)} new links found. Proceed with scraping? [Y/n] ").strip().lower()
+    if answer not in ("y", "yes", ""):
+        logging.info("User aborted scraping.")
+        return
+
+    logging.info("Scraping property details and writing to Supabase + R2...")
+    df = get_details(listings, source="mubawab", listing_type="rent")
     logging.info("Scraped %d NEW properties this run.", len(df))
     logging.info("Done.")
-    
 
 if __name__ == "__main__":
     main()

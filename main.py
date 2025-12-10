@@ -8,7 +8,7 @@ def main():
     )
 
     # 1. Choose the base URL and number of pages to scrape
-    base_url = "https://www.mubawab.ma/en/ct/casablanca/real-estate-for-sale"
+    base_url = "https://www.mubawab.ma/en/cc/real-estate-for-sale"
     max_pages = 1 
 
     logging.info("Starting link scraping...")
